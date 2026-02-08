@@ -2,13 +2,14 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import warnings
+import ast
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 # =========================
 # Config
 # =========================
-CSV_PATH = "masterquarterly.csv"   # change to your path
+CSV_PATH = "masterquarterly.csv"   # <-- change to your local path
 
 TIME_COL = "Quarter"
 SEX_COL = "Sex"
@@ -25,21 +26,21 @@ FORECAST_END = "2050Q4"
 MARK_YEARS = [2026, 2030, 2035, 2050]
 TICK_STEP_YEARS = 5
 
-# multi-step horizons and weights
+# rolling multi-step validation
 HORIZONS = [1, 4, 8, 12, 16]
 WEIGHTS = {1: 0.35, 4: 0.25, 8: 0.20, 12: 0.12, 16: 0.08}
 
 USE_LOGIT = True
-# force trend = 'c' to allow drift (discussed in report)
-FORCE_TREND = "c"
 
-# grid (keep small)
-ORDERS = [(0,1,1), (1,1,0), (1,1,1), (0,1,0)]
-SEASONALS = [(0,0,0,0), (1,0,0,4), (0,0,1,4)]
+# grid search
+ORDERS = [(0, 1, 1), (1, 1, 0), (1, 1, 1), (0, 1, 0)]
+SEASONALS = [(0, 0, 0, 0), (1, 0, 0, 4), (0, 0, 1, 4)]
+TRENDS = ["n", "c"]
 
-# uncertainty band
-ALPHA_LOW, ALPHA_HIGH = 0.05, 0.95  # 90% interval
+# uncertainty band from simulation
+ALPHA_LOW, ALPHA_HIGH = 0.05, 0.95     # 90% interval
 SIM_N = 300
+BAND_ALPHA = 0.15                      # visual transparency only (same for male/female)
 
 # coupled CP
 RANK = 3
@@ -47,7 +48,7 @@ ALS_ITERS = 250
 SEED = 42
 
 # outputs
-OUT_GRID = "grid_results_multistep_trend_c.csv"
+OUT_GRID = "grid_results_multistep.csv"
 OUT_SEX_Q = "sex_share_forecast_quarterly_with_band.csv"
 OUT_TARGET_SEX = "targets_annual_mean_sex_with_band.csv"
 OUT_SEX_AGE = "pred_sex_age_with_band.csv"
@@ -57,8 +58,11 @@ OUT_SEX_BORN = "pred_sex_born_with_band.csv"
 # =========================
 # Helpers
 # =========================
-def parse_q(s): return pd.Period(str(s).strip().replace(" ", ""), freq="Q")
-def qlabel(p): return f"{p.year}Q{p.quarter}"
+def parse_q(s) -> pd.Period:
+    return pd.Period(str(s).strip().replace(" ", ""), freq="Q")
+
+def qlabel(p: pd.Period) -> str:
+    return f"{p.year}Q{p.quarter}"
 
 def clip01(x, eps=1e-6):
     x = np.asarray(x, dtype=float)
@@ -72,7 +76,8 @@ def inv_logit(z):
     z = np.asarray(z, dtype=float)
     return 1 / (1 + np.exp(-z))
 
-def mae(a, b): return float(np.mean(np.abs(np.asarray(a) - np.asarray(b))))
+def mae(a, b):
+    return float(np.mean(np.abs(np.asarray(a) - np.asarray(b))))
 
 def bern_kl(p, q):
     p = clip01(p); q = clip01(q)
@@ -85,6 +90,7 @@ def fit_sarimax(y, order, seasonal_order, trend):
             y, order=order, seasonal_order=seasonal_order, trend=trend,
             enforce_stationarity=False, enforce_invertibility=False
         ).fit(disp=False)
+    # if optimizer says not converged, skip
     if hasattr(res, "mle_retvals") and isinstance(res.mle_retvals, dict):
         if not bool(res.mle_retvals.get("converged", True)):
             return None
@@ -102,16 +108,178 @@ def year_ticks(periods, step=5):
             lab.append(str(y))
     return pos, lab
 
-def annual_mean_with_band(sex_df):
-    tmp = sex_df.copy()
+def band_percent(alpha_low, alpha_high):
+    return int(round((alpha_high - alpha_low) * 100))
+
+def annual_mean_with_band(df_q):
+    tmp = df_q.copy()
     tmp["__p__"] = tmp["Quarter"].map(parse_q)
     tmp["Year"] = tmp["__p__"].apply(lambda p: p.year)
     num_cols = [c for c in tmp.columns if c not in ["Quarter", "__p__", "Year"]]
     out = tmp.groupby("Year")[num_cols].mean().reset_index()
     return out
 
+
 # =========================
-# Load + male share
+# Plotting functions
+# =========================
+def plot_sex_share(p_all, hist_len,
+                   male_mean, female_mean, male_p05, male_p95, female_p05, female_p95,
+                   train_end_p, val_end_p,
+                   mark_years, tick_step_years,
+                   alpha_low, alpha_high, band_alpha):
+    x = np.arange(len(p_all))
+    plt.figure(figsize=(13, 6))
+
+    # Male: same color for hist and forecast (solid vs dashed)
+    m_line, = plt.plot(x[:hist_len], male_mean[:hist_len], label="Male", linestyle="-")
+    c_m = m_line.get_color()
+    plt.plot(x[hist_len-1:], male_mean[hist_len-1:], linestyle="--", color=c_m)
+
+    # Female
+    f_line, = plt.plot(x[:hist_len], female_mean[:hist_len], label="Female", linestyle="-")
+    c_f = f_line.get_color()
+    plt.plot(x[hist_len-1:], female_mean[hist_len-1:], linestyle="--", color=c_f)
+
+    pct = band_percent(alpha_low, alpha_high)
+    plt.fill_between(x[hist_len:], male_p05[hist_len:], male_p95[hist_len:], alpha=band_alpha, color=c_m,
+                     label=f"Male {pct}% band")
+    plt.fill_between(x[hist_len:], female_p05[hist_len:], female_p95[hist_len:], alpha=band_alpha, color=c_f,
+                     label=f"Female {pct}% band")
+
+    # Splits
+    plt.axvline(p_all.index(train_end_p), color="k", linestyle="--", linewidth=1, label="Train/Val split")
+    plt.axvline(p_all.index(val_end_p), color="k", linestyle="-.", linewidth=1, label="Val/Forecast split")
+
+    # Target years
+    for y in mark_years:
+        q = pd.Period(f"{y}Q1", freq="Q")
+        if q in p_all:
+            plt.axvline(p_all.index(q), linestyle=":", linewidth=1)
+
+    pos, lab = year_ticks(p_all, step=tick_step_years)
+    plt.xticks(pos, lab)
+    plt.xlabel("Year")
+    plt.ylabel("Share")
+    plt.title("Sex composition (quarterly, historical & projected)")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def choose_top_band_keys(wide_df, sex_levels, cats, hist_len, top_k=1):
+    # choose category per sex with largest mean share averaged over last 8 historical quarters
+    start = max(0, hist_len - 8)
+    end = hist_len
+    keys = []
+    for s in sex_levels:
+        bases = [f"{s.replace(' ', '_')}_{c}".replace(" ", "_").replace(":", "") for c in cats]
+        vals = []
+        for b in bases:
+            col = f"{b}_mean"
+            if col in wide_df.columns:
+                v = wide_df[col].iloc[start:end].astype(float).mean()
+                vals.append((b, float(v)))
+        vals.sort(key=lambda t: t[1], reverse=True)
+        keys += [b for b, _ in vals[:top_k]]
+    return keys
+
+
+def plot_sex_x_all(wide_df, title, sex_levels, cats, hist_len,
+                   train_end_p, val_end_p, mark_years, tick_step_years,
+                   alpha_low, alpha_high, band_alpha, band_top_k=1,
+                   label_fontsize=8, label_dx=6.0, min_label_gap=0.012):
+    """
+    Line style encodes ONLY: historical (solid) vs forecast (dashed).
+    Sex is encoded by color + direct labels.
+    Direct-label every line inside the axes near the right edge.
+    """
+    periods = [parse_q(q) for q in wide_df["Quarter"]]
+    x = np.arange(len(periods))
+    plt.figure(figsize=(13, 6))
+
+    colors = {}
+    end_idx = len(periods) - 1
+    series_endpoints = []  # (y_end, base, color)
+
+    # 1) plot all mean lines: historical solid, forecast dashed (same color)
+    for s in sex_levels:
+        for c in cats:
+            base = f"{s.replace(' ', '_')}_{c}".replace(" ", "_").replace(":", "")
+            col_mean = f"{base}_mean"
+            if col_mean not in wide_df.columns:
+                continue
+
+            y = wide_df[col_mean].astype(float).values
+
+            ln, = plt.plot(x[:hist_len], y[:hist_len],
+                           linewidth=1.0, linestyle="-", label="_nolegend_")
+            color = ln.get_color()
+            plt.plot(x[hist_len-1:], y[hist_len-1:],
+                     linewidth=1.0, linestyle="--", color=color, label="_nolegend_")
+
+            colors[base] = color
+            series_endpoints.append([float(y[end_idx]), base, color])
+
+    # 2) bands only for top categories per sex
+    pct = band_percent(alpha_low, alpha_high)
+    top_keys = choose_top_band_keys(wide_df, sex_levels, cats, hist_len, top_k=band_top_k)
+    for base in top_keys:
+        col_p05 = f"{base}_p05"
+        col_p95 = f"{base}_p95"
+        if col_p05 in wide_df.columns and col_p95 in wide_df.columns:
+            lo = wide_df[col_p05].astype(float).values
+            hi = wide_df[col_p95].astype(float).values
+            plt.fill_between(
+                x[hist_len:], lo[hist_len:], hi[hist_len:],
+                alpha=band_alpha, color=colors.get(base, None),
+                label=f"{base} {pct}% band"
+            )
+
+    # 3) split lines with legend
+    plt.axvline(periods.index(train_end_p), color="k", linestyle="--", linewidth=1, label="Train/Val split")
+    plt.axvline(periods.index(val_end_p), color="k", linestyle="-.", linewidth=1, label="Val/Forecast split")
+
+    # target years (no legend)
+    for y in mark_years:
+        q = pd.Period(f"{y}Q1", freq="Q")
+        if q in periods:
+            plt.axvline(periods.index(q), linestyle=":", linewidth=1, label="_nolegend_")
+
+    # 4) direct labels INSIDE plot near right edge (avoid overlap)
+    series_endpoints.sort(key=lambda t: t[0])
+    adjusted = []
+    for y_end, base, color in series_endpoints:
+        y_adj = y_end
+        if adjusted:
+            y_prev = adjusted[-1][0]
+            if y_adj - y_prev < min_label_gap:
+                y_adj = y_prev + min_label_gap
+        adjusted.append([y_adj, y_end, base, color])
+
+    x_text = x[end_idx] - label_dx
+    for y_adj, y_end, base, color in adjusted:
+        plt.plot([x[end_idx]-0.2, x_text+0.2], [y_end, y_adj], color=color, linewidth=0.6, alpha=0.7)
+        plt.text(
+            x_text, y_adj, base,
+            color=color, fontsize=label_fontsize, va="center", ha="left",
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=1.5)
+        )
+
+    # 5) axes
+    pos, lab = year_ticks(periods, step=tick_step_years)
+    plt.xticks(pos, lab)
+    plt.xlabel("Year")
+    plt.ylabel("Overall share")
+    plt.title(title)
+
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    plt.show()
+
+
+# =========================
+# 1) Load + build male share series
 # =========================
 df = pd.read_csv(CSV_PATH)
 df.columns = [c.strip() for c in df.columns]
@@ -141,7 +309,7 @@ male_share = (tot[male_label] / total_all).fillna(0.0)
 if len(male_share) < TRAIN_N + VAL_N:
     raise ValueError(f"Not enough points: got {len(male_share)}, need {TRAIN_N+VAL_N}.")
 
-# sanity check (last 5y)
+# sanity check
 recent = male_share.values[-20:]
 slope = np.polyfit(np.arange(20), recent, 1)[0]
 std = float(np.std(recent))
@@ -149,8 +317,9 @@ print("\nSanity check (last 5 years / 20 quarters):")
 print(f"  std(male_share) = {std:.6f}")
 print(f"  slope per quarter = {slope:.6e}  (per year approx {4*slope:.6e})")
 
+
 # =========================
-# Rolling multi-step grid search (trend forced to 'c')
+# 2) Rolling multi-step evaluation + grid search (trend n/c)
 # =========================
 def rolling_eval(series, order, seas, trend):
     y = series.values.astype(float)
@@ -185,34 +354,33 @@ def rolling_eval(series, order, seas, trend):
 rows = []
 for order in ORDERS:
     for seas in SEASONALS:
-        tr = FORCE_TREND  # <--- force 'c'
-        m = rolling_eval(male_share, order, seas, tr)
-        if m is None:
-            continue
-
-        wKL = sum(WEIGHTS[h] * m[h]["KL"] for h in HORIZONS)
-        wMAE = sum(WEIGHTS[h] * m[h]["MAE"] for h in HORIZONS)
-
-        row = {"order": str(order), "seasonal_order": str(seas), "trend": tr,
-               "use_logit": USE_LOGIT, "wKL": wKL, "wMAE": wMAE}
-        for h in HORIZONS:
-            row[f"KL_h{h}"] = m[h]["KL"]
-            row[f"MAE_h{h}"] = m[h]["MAE"]
-            row[f"N_h{h}"] = m[h]["N"]
-        rows.append(row)
+        for tr in TRENDS:
+            m = rolling_eval(male_share, order, seas, tr)
+            if m is None:
+                continue
+            wKL = sum(WEIGHTS[h] * m[h]["KL"] for h in HORIZONS)
+            wMAE = sum(WEIGHTS[h] * m[h]["MAE"] for h in HORIZONS)
+            row = {"order": str(order), "seasonal_order": str(seas), "trend": tr,
+                   "use_logit": USE_LOGIT, "wKL": wKL, "wMAE": wMAE}
+            for h in HORIZONS:
+                row[f"KL_h{h}"] = m[h]["KL"]
+                row[f"MAE_h{h}"] = m[h]["MAE"]
+                row[f"N_h{h}"] = m[h]["N"]
+            rows.append(row)
 
 grid = pd.DataFrame(rows).sort_values(["wKL", "wMAE"]).reset_index(drop=True)
 grid.to_csv(OUT_GRID, index=False)
 best = grid.iloc[0]
 print("\nSaved grid results:", OUT_GRID)
-print("Best config (trend forced to 'c'):", best.to_dict())
+print("Best config:", best.to_dict())
 
-best_order = eval(best["order"])
-best_seas = eval(best["seasonal_order"])
+best_order = ast.literal_eval(best["order"])
+best_seas = ast.literal_eval(best["seasonal_order"])
 best_trend = best["trend"]
 
+
 # =========================
-# Fit best on full history -> mean forecast + simulation band
+# 3) Fit best on full history -> forecast mean + simulate band
 # =========================
 p_end = parse_q(FORECAST_END)
 p_all = list(pd.period_range(p_hist[0], p_end, freq="Q"))
@@ -231,13 +399,12 @@ fc = clip01(fc)
 male_mean = np.concatenate([male_share.values, fc])
 female_mean = 1.0 - male_mean
 
-# simulate future (transformed space) then convert
+# simulate
 sim = res_full.simulate(nsimulations=steps_ahead, repetitions=SIM_N, anchor="end")
 sim = np.asarray(sim)
 sim = np.squeeze(sim)
 if sim.ndim == 1:
     sim = sim.reshape(-1, 1)
-# make (steps, reps)
 if sim.shape[0] != steps_ahead and sim.shape[1] == steps_ahead:
     sim = sim.T
 
@@ -274,49 +441,32 @@ print("Saved:", OUT_TARGET_SEX)
 print("\nTarget-year annual mean sex shares (mean/p05/p95):")
 print(targets.to_string(index=False))
 
-# =========================
-# Plot sex share + splits
-# =========================
+# boundaries
 train_end_p = p_hist[TRAIN_N-1]
 val_end_p = p_hist[TRAIN_N+VAL_N-1]
 
-x = np.arange(len(p_all))
-plt.figure(figsize=(13, 6))
-plt.plot(x[:hist_len], male_mean[:hist_len], label="Male (hist)")
-plt.plot(x[:hist_len], female_mean[:hist_len], label="Female (hist)")
-plt.plot(x[hist_len-1:], male_mean[hist_len-1:], linestyle="--", label="Male (mean fc)")
-plt.plot(x[hist_len-1:], female_mean[hist_len-1:], linestyle="--", label="Female (mean fc)")
-plt.fill_between(x[hist_len:], male_p05[hist_len:], male_p95[hist_len:], alpha=0.2,
-                 label=f"Male {int((ALPHA_HIGH-ALPHA_LOW)*100)}% band (sim)")
+# plot sex share (with female band + consistent colors)
+plot_sex_share(
+    p_all, hist_len,
+    male_mean, female_mean,
+    male_p05, male_p95,
+    female_p05, female_p95,
+    train_end_p, val_end_p,
+    MARK_YEARS, TICK_STEP_YEARS,
+    ALPHA_LOW, ALPHA_HIGH, BAND_ALPHA
+)
 
-plt.axvline(p_all.index(train_end_p), color="k", linestyle="--", linewidth=1, label="Train/Val split")
-plt.axvline(p_all.index(val_end_p), color="k", linestyle="-.", linewidth=1, label="Val/Forecast split")
-
-for y in MARK_YEARS:
-    q = pd.Period(f"{y}Q1", freq="Q")
-    if q in p_all:
-        plt.axvline(p_all.index(q), linestyle=":", linewidth=1)
-
-pos, lab = year_ticks(p_all, step=TICK_STEP_YEARS)
-plt.xticks(pos, lab)
-plt.xlabel("Year")
-plt.ylabel("Share")
-plt.title("Sex composition (quarterly, historical & projected)")
-plt.legend()
-plt.tight_layout()
-plt.show()
 
 # =========================
-# Coupled CP on conditional shares + propagate sex band
+# 4) Coupled CP on conditional shares + propagate sex band to sex×(age/edu/born)
 # =========================
 def build_conditional_long(cols):
     use = ["__p__", SEX_COL, TOTAL_AGE_COL] + [c for c in cols if c in df.columns]
     tmp = df[use].copy()
     denom = tmp[TOTAL_AGE_COL].replace(0.0, np.nan)
     for c in cols:
-        if c in tmp.columns:
-            tmp[c] = tmp[c] / denom
-    return tmp[["__p__", SEX_COL] + [c for c in cols if c in tmp.columns]]
+        tmp[c] = tmp[c] / denom
+    return tmp[["__p__", SEX_COL] + cols]
 
 def to_tensor(long_df, cols, periods, sexes):
     idx = pd.Index(periods, name="__p__")
@@ -377,12 +527,11 @@ def reconstruct(U, V, W):
     return X / d
 
 def forecast_latent(u_hist, steps):
-    y = np.asarray(u_hist, float)
-    # compact default (can be grid-searched later if needed)
-    res = fit_sarimax(y, order=(1,1,0), seasonal_order=(1,0,0,4), trend="c")
+    # compact default model for latent factors
+    res = fit_sarimax(np.asarray(u_hist, float), order=(1,1,0), seasonal_order=(1,0,0,4), trend="c")
     if res is None:
-        a, b = np.polyfit(np.arange(len(y)), y, 1)
-        return a*np.arange(len(y), len(y)+steps) + b
+        a, b = np.polyfit(np.arange(len(u_hist)), np.asarray(u_hist, float), 1)
+        return a*np.arange(len(u_hist), len(u_hist)+steps) + b
     return np.asarray(res.forecast(steps=steps), float)
 
 AGE_USE = [c for c in AGE_COLS if c in df.columns]
@@ -404,25 +553,28 @@ Xhat_age = reconstruct(U_all, V_sex, W_age)
 Xhat_edu = reconstruct(U_all, V_sex, W_edu)
 Xhat_born = reconstruct(U_all, V_sex, W_born)
 
-# propagate sex band to overall shares (conditional treated as point estimate)
+# sex share dfs for propagation
 sex_mean_df = pd.DataFrame({male_label: male_mean, female_label: 1.0-male_mean}, index=p_all)
 sex_p05_df  = pd.DataFrame({male_label: male_p05,  female_label: 1.0-male_p95}, index=p_all)
 sex_p95_df  = pd.DataFrame({male_label: male_p95,  female_label: 1.0-male_p05}, index=p_all)
 
 def build_wide_with_band(Xhat, cats, out_csv):
     rows = []
-    sex_to_j = {s:j for j,s in enumerate(sex_levels)}
+    sex_to_j = {s: j for j, s in enumerate(sex_levels)}
     for i, p in enumerate(p_all):
         q = qlabel(p)
         for s in sex_levels:
             j = sex_to_j[s]
             cond = Xhat[i, j, :]
+            ps_m = float(sex_mean_df.loc[p, s])
+            ps_l = float(sex_p05_df.loc[p, s])
+            ps_u = float(sex_p95_df.loc[p, s])
             for k, cat in enumerate(cats):
                 rows.append({
                     "Quarter": q, "Sex": s, "Category": cat,
-                    "mean": float(sex_mean_df.loc[p, s]) * float(cond[k]),
-                    "p05":  float(sex_p05_df.loc[p, s])  * float(cond[k]),
-                    "p95":  float(sex_p95_df.loc[p, s])  * float(cond[k]),
+                    "mean": ps_m * float(cond[k]),
+                    "p05":  ps_l * float(cond[k]),
+                    "p95":  ps_u * float(cond[k]),
                 })
     long = pd.DataFrame(rows)
     long["col"] = long["Sex"].str.replace(" ", "_") + "_" + long["Category"].astype(str).str.replace(" ", "_").str.replace(":", "", regex=False)
@@ -441,42 +593,18 @@ wide_age = build_wide_with_band(Xhat_age, AGE_USE, OUT_SEX_AGE)
 wide_edu = build_wide_with_band(Xhat_edu, EDU_USE, OUT_SEX_EDU)
 wide_born = build_wide_with_band(Xhat_born, BORN_USE, OUT_SEX_BORN)
 
-# simple plotting: show a few representative series to keep readable
-def plot_selected(wide_df, title, keys):
-    periods = [parse_q(q) for q in wide_df["Quarter"]]
-    x = np.arange(len(periods))
-    hist_end = p_hist[-1]
-    hist_mask = np.array([p <= hist_end for p in periods])
+# plot all mean lines + band for top category per sex
+plot_sex_x_all(wide_age,  "Sex × Age (mean lines for all categories; band for top shares)",
+               sex_levels, AGE_USE, hist_len, train_end_p, val_end_p, MARK_YEARS, TICK_STEP_YEARS,
+               ALPHA_LOW, ALPHA_HIGH, BAND_ALPHA, band_top_k=1)
 
-    plt.figure(figsize=(13, 6))
-    for k in keys:
-        m = wide_df[f"{k}_mean"].values.astype(float)
-        lo = wide_df[f"{k}_p05"].values.astype(float)
-        hi = wide_df[f"{k}_p95"].values.astype(float)
-        plt.plot(x[:hist_len], m[:hist_len], label=f"{k} (hist)")
-        plt.plot(x[hist_len-1:], m[hist_len-1:], linestyle="--", label=f"{k} (mean fc)")
-        plt.fill_between(x[hist_len:], lo[hist_len:], hi[hist_len:], alpha=0.15)
+plot_sex_x_all(wide_edu,  "Sex × Education (mean lines for all categories; band for top shares)",
+               sex_levels, EDU_USE, hist_len, train_end_p, val_end_p, MARK_YEARS, TICK_STEP_YEARS,
+               ALPHA_LOW, ALPHA_HIGH, BAND_ALPHA, band_top_k=1)
 
-    plt.axvline(periods.index(train_end_p), color="k", linestyle="--", linewidth=1)
-    plt.axvline(periods.index(val_end_p), color="k", linestyle="-.", linewidth=1)
-    for y in MARK_YEARS:
-        q = pd.Period(f"{y}Q1", freq="Q")
-        if q in periods:
-            plt.axvline(periods.index(q), linestyle=":", linewidth=1)
+plot_sex_x_all(wide_born, "Sex × Place of birth (mean lines for all categories; band for top shares)",
+               sex_levels, BORN_USE, hist_len, train_end_p, val_end_p, MARK_YEARS, TICK_STEP_YEARS,
+               ALPHA_LOW, ALPHA_HIGH, BAND_ALPHA, band_top_k=1)
 
-    pos, lab = year_ticks(periods, step=TICK_STEP_YEARS)
-    plt.xticks(pos, lab)
-    plt.xlabel("Year")
-    plt.ylabel("Overall share")
-    plt.title(title)
-    plt.legend(fontsize=8)
-    plt.tight_layout()
-    plt.show()
-
-# choose a few keys that almost certainly exist
-# (update these names if your sex labels differ)
-sel_age = [f"{male_label.replace(' ','_')}_{AGE_USE[1].replace(' ','_')}".replace(":", ""),
-           f"{female_label.replace(' ','_')}_{AGE_USE[1].replace(' ','_')}".replace(":", "")]
-plot_selected(wide_age, "Sex × Age (selected series, mean + band)", sel_age)
 
 
